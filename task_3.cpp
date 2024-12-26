@@ -3,9 +3,12 @@
 #include <vector>
 #include <atomic>
 #include <hiredis/hiredis.h>
+#include <hiredis/async.h>
+#include <hiredis/adapters/libevent.h>
 #include <nlohmann/json.hpp> // for JSON parsing
 #include <cstdlib>
 #include <csignal>
+#include <event2/event.h>
 
 using json = nlohmann::json;
 
@@ -32,38 +35,35 @@ void process_message(const std::string &message, const std::string &consumer_id,
     }
 }
 
+void on_message(redisAsyncContext *ctx, void *reply, void *privdata) {
+    if (reply == nullptr) return;
+    redisReply *redis_reply = (redisReply *)reply;
+
+    if (redis_reply->type == REDIS_REPLY_ARRAY && redis_reply->elements == 3) {
+        std::string consumer_id = *(std::string *)privdata;
+        std::string message = redis_reply->element[2]->str;
+        process_message(message, consumer_id, ctx->c);
+    }
+}
+
 void consumer_thread(const std::string &consumer_id, const std::string &channel, const std::string &redis_host, int redis_port) {
-    redisContext *redis_ctx = redisConnect(redis_host.c_str(), redis_port);
+    struct event_base *base = event_base_new();
+    redisAsyncContext *redis_ctx = redisAsyncConnect(redis_host.c_str(), redis_port);
+
     if (redis_ctx == nullptr || redis_ctx->err) {
-        std::cerr << "Error: Unable to connect to Redis." << std::endl;
-        if (redis_ctx) redisFree(redis_ctx);
+        std::cerr << "Error: Unable to connect to Redis asynchronously." << std::endl;
+        if (redis_ctx) redisAsyncFree(redis_ctx);
         return;
     }
 
-    redisReply *reply = (redisReply *)redisCommand(redis_ctx, ("SUBSCRIBE " + channel).c_str());
-    if (reply == nullptr) {
-        std::cerr << "Error: SUBSCRIBE command failed." << std::endl;
-        redisFree(redis_ctx);
-        return;
-    }
-    freeReplyObject(reply);
+    redisLibeventAttach(redis_ctx, base);
+    redisAsyncCommand(redis_ctx, nullptr, nullptr, "SUBSCRIBE %s", channel.c_str());
+    redisAsyncCommand(redis_ctx, on_message, (void *)&consumer_id, "SUBSCRIBE %s", channel.c_str());
 
-    while (keep_running) {
-        void *reply_raw;
-        if (redisGetReply(redis_ctx, &reply_raw) == REDIS_OK) {
-            redisReply *reply = (redisReply *)reply_raw;
-            if (reply && reply->type == REDIS_REPLY_ARRAY && reply->elements == 3) {
-                std::string message = reply->element[2]->str;
-                process_message(message, consumer_id, redis_ctx);
-            }
-            freeReplyObject(reply);
-        } else {
-            std::cerr << "Error: Failed to get reply from Redis." << std::endl;
-            break;
-        }
-    }
+    event_base_dispatch(base);
 
-    redisFree(redis_ctx);
+    redisAsyncFree(redis_ctx);
+    event_base_free(base);
 }
 
 int main(int argc, char *argv[]) {
