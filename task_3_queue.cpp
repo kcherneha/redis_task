@@ -14,6 +14,7 @@
 #include <cstring>
 #include <unistd.h> // for read(), write()
 #include <chrono>
+#include <cassert> // For testing
 
 using json = nlohmann::json;
 
@@ -165,6 +166,26 @@ void consumer_thread(const std::string &consumer_id, const std::string &channel,
     redisFree(redis_ctx);
 }
 
+// Unit Test: Simulate message processing
+void test_message_processing() {
+    std::string message = R"({"message_id": "12345", "data": "Test"})";
+    std::string consumer_id = "consumer_test";
+
+    // Simulate processing
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        message_queue.emplace(message, consumer_id);
+    }
+
+    queue_condition.notify_one();
+
+    // Ensure message gets processed
+    int initial_count = messages_processed.load();
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    assert(messages_processed.load() == initial_count + 1);
+    std::cout << "Test passed: Message processed successfully." << std::endl;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         std::cerr << "Usage: " << argv[0] << " <consumer_count> <redis_host> <redis_port>" << std::endl;
@@ -193,6 +214,9 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < consumer_count; ++i) {
         consumers.emplace_back(consumer_thread, "consumer_" + std::to_string(i + 1), channel, redis_host, redis_port);
     }
+
+    // Run unit test
+    test_message_processing();
 
     for (auto &thread : consumers) {
         thread.join();
