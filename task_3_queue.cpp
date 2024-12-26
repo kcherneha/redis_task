@@ -13,10 +13,12 @@
 #include <csignal>
 #include <cstring>
 #include <unistd.h> // for read(), write()
+#include <chrono>
 
 using json = nlohmann::json;
 
 std::atomic<bool> keep_running(true);
+std::atomic<int> messages_processed(0);
 std::unordered_set<std::string> processed_messages;
 std::mutex processed_messages_mutex;
 std::queue<std::pair<std::string, std::string>> message_queue;
@@ -26,6 +28,15 @@ std::condition_variable queue_condition;
 void signal_handler(int signum) {
     keep_running = false;
     queue_condition.notify_all();
+}
+
+void monitor_throughput() {
+    while (keep_running) {
+        int start_count = messages_processed.load();
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        int end_count = messages_processed.load();
+        std::cout << "Messages processed in last 3 seconds: " << (end_count - start_count) << std::endl;
+    }
 }
 
 void send_xadd(int socket_fd, const std::string &stream, const std::string &message_id, const std::string &processed_by) {
@@ -85,6 +96,9 @@ void process_message_batch(int socket_fd) {
 
                 // Use XADD to append to the Redis stream
                 send_xadd(socket_fd, "messages:processed", message_id, consumer_id);
+
+                // Increment the processed messages count
+                messages_processed.fetch_add(1, std::memory_order_relaxed);
 
             } catch (const std::exception &e) {
                 std::cerr << "Error processing message: " << e.what() << std::endl;
@@ -164,6 +178,9 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT, signal_handler);
 
+    // Start monitoring thread
+    std::thread monitor_thread(monitor_throughput);
+
     // Start a thread pool for processing
     int thread_pool_size = std::thread::hardware_concurrency();
     std::vector<std::thread> workers;
@@ -186,6 +203,10 @@ int main(int argc, char *argv[]) {
     for (auto &worker : workers) {
         worker.join();
     }
+
+    // Stop monitoring thread
+    keep_running = false;
+    monitor_thread.join();
 
     return 0;
 }
