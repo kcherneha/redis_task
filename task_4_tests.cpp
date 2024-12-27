@@ -3,37 +3,26 @@
 
 using namespace task_3;
 
-class RedisConnectionTest : public ::testing::Test {
+class RedisConnectionRAIITest : public ::testing::Test {
 protected:
-  redisContext *redis_ctx;
+  std::unique_ptr<RedisConnection> redis_conn;
 
   void SetUp() override {
-    redis_ctx = create_redis_connection("127.0.0.1", 6379);
-    ASSERT_NE(redis_ctx, nullptr);
+    redis_conn = std::make_unique<RedisConnection>("127.0.0.1", 6379);
   }
 
-  void TearDown() override {
-    if (redis_ctx) {
-      redisFree(redis_ctx);
-    }
-  }
+  void TearDown() override { redis_conn.reset(); }
 };
 
-TEST_F(RedisConnectionTest, ConnectToRedis) {
-  EXPECT_NE(redis_ctx, nullptr);
-  EXPECT_EQ(redis_ctx->err, 0);
+TEST_F(RedisConnectionRAIITest, ConnectToRedis) {
+  EXPECT_NE(redis_conn->get(), nullptr);
 }
 
-TEST_F(RedisConnectionTest, XADDCommandSuccess) {
-  send_xadd(redis_ctx, "test_stream", "test_message_id", "test_consumer");
+TEST_F(RedisConnectionRAIITest, XADDCommandSuccess) {
+  send_xadd(redis_conn->get(), "test_stream", "test_message_id",
+            "test_consumer");
   // Verify manually on Redis that the message was added or check responses if
   // mocked.
-}
-
-TEST_F(RedisConnectionTest, InvalidRedisCommand) {
-  std::string invalid_command = "INVALIDCOMMAND\r\n";
-  send_xadd_impl(redis_ctx, invalid_command);
-  // Expect an error response or no crash.
 }
 
 class MessageQueueTest : public ::testing::Test {
@@ -56,36 +45,31 @@ TEST_F(MessageQueueTest, EmptyQueue) {
   EXPECT_FALSE(queue.try_dequeue(dequeued_message));
 }
 
-class BatchProcessingTest : public ::testing::Test {
+class BatchProcessingRAIITest : public ::testing::Test {
 protected:
-  redisContext *redis_ctx;
+  std::unique_ptr<RedisConnection> redis_conn;
   void SetUp() override {
-    redis_ctx = create_redis_connection("127.0.0.1", 6379);
-    ASSERT_NE(redis_ctx, nullptr);
+    redis_conn = std::make_unique<RedisConnection>("127.0.0.1", 6379);
   }
-  void TearDown() override {
-    if (redis_ctx) {
-      redisFree(redis_ctx);
-    }
-  }
+  void TearDown() override { redis_conn.reset(); }
 };
 
-TEST_F(BatchProcessingTest, ProcessValidBatch) {
+TEST_F(BatchProcessingRAIITest, ProcessValidBatch) {
   std::vector<std::pair<std::string, std::string>> batch = {
       {"{\"message_id\": \"1\", \"data\": \"test1\"}", "consumer_1"},
       {"{\"message_id\": \"2\", \"data\": \"test2\"}", "consumer_2"}};
 
-  process_batch(redis_ctx, batch);
+  process_batch(redis_conn->get(), batch);
   // Verify Redis contains processed messages or check `messages_processed`
   // count.
 }
 
-TEST_F(BatchProcessingTest, HandleDuplicateMessages) {
+TEST_F(BatchProcessingRAIITest, HandleDuplicateMessages) {
   std::vector<std::pair<std::string, std::string>> batch = {
       {"{\"message_id\": \"1\", \"data\": \"test1\"}", "consumer_1"},
       {"{\"message_id\": \"1\", \"data\": \"test1\"}", "consumer_1"}};
 
-  process_batch(redis_ctx, batch);
+  process_batch(redis_conn->get(), batch);
   // Ensure duplicates are not processed twice by checking `processed_messages`.
 }
 

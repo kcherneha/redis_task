@@ -20,25 +20,17 @@ int main(int argc, char *argv[]) {
     consumers.emplace_back(consumer_thread, "consumer_" + std::to_string(i + 1),
                            channel, redis_host, redis_port);
   }
-  redisContext *xadd_redis_ctx =
-      create_redis_connection(redis_host, redis_port);
-  if (!xadd_redis_ctx) {
-    keep_running = false;
-    for (auto &consumer : consumers)
-      consumer.join();
-    monitor_thread.join();
-    return 1;
-  }
+  RedisConnection ctx(redis_host, redis_port);
+
   std::vector<std::thread> workers;
   int thread_pool_size = consumer_count;
   for (int i = 0; i < thread_pool_size; ++i) {
-    workers.emplace_back(process_message_batch, xadd_redis_ctx);
+    workers.emplace_back(process_message_batch, std::ref(ctx));
   }
   for (auto &consumer : consumers)
     consumer.join();
   for (auto &worker : workers)
     worker.join();
-  redisFree(xadd_redis_ctx);
   keep_running = false;
   monitor_thread.join();
   return 0;
