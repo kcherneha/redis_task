@@ -58,68 +58,50 @@ redisContext *create_redis_connection(const std::string &redis_host,
   return redis_ctx;
 }
 
-// Use Redis Set for processed messages
-bool is_message_processed(redisContext *redis_ctx,
-                          const std::string &message_id) {
-  std::string command = "SISMEMBER processed_messages " + message_id + "\r\n";
-  redisReply *reply =
-      static_cast<redisReply *>(redisCommand(redis_ctx, command.c_str()));
-  if (reply) {
-    bool result = reply->integer == 1;
-    freeReplyObject(reply);
-    return result;
-  }
-  return false;
-}
+// Consume messages using Redis Streams and Consumer Groups
+void consume_stream_messages(redisContext *redis_ctx, const std::string &group,
+                             const std::string &consumer) {
+  while (keep_running) {
+    std::string command = "XREADGROUP GROUP " + group + " " + consumer +
+                          " COUNT " + std::to_string(BATCH_SIZE) +
+                          " BLOCK 1000 STREAMS messages:published >\r\n";
+    redisReply *reply =
+        static_cast<redisReply *>(redisCommand(redis_ctx, command.c_str()));
 
-void mark_message_as_processed(redisContext *redis_ctx,
-                               const std::string &message_id) {
-  std::string command = "SADD processed_messages " + message_id + "\r\n";
-  redisReply *reply =
-      static_cast<redisReply *>(redisCommand(redis_ctx, command.c_str()));
-  if (reply) {
-    freeReplyObject(reply);
-  }
-}
-
-// Use Redis List for message queue
-void enqueue_message(redisContext *redis_ctx, const std::string &message,
-                     const std::string &consumer_id) {
-  std::string command =
-      "LPUSH messages_queue " + message + " " + consumer_id + "\r\n";
-  redisReply *reply =
-      static_cast<redisReply *>(redisCommand(redis_ctx, command.c_str()));
-  if (reply) {
-    freeReplyObject(reply);
-  }
-}
-
-std::pair<std::string, std::string> dequeue_message(redisContext *redis_ctx) {
-  std::string command = "RPOP messages_queue\r\n";
-  redisReply *reply =
-      static_cast<redisReply *>(redisCommand(redis_ctx, command.c_str()));
-  if (reply && reply->type == REDIS_REPLY_STRING) {
-    std::string message(reply->str, reply->len);
-    freeReplyObject(reply);
-    return {message, ""}; // Include consumer_id handling if needed
-  }
-  return {"", ""};
-}
-
-std::vector<std::pair<std::string, std::string>>
-fetch_message_batch(redisContext *redis_ctx) {
-  std::vector<std::pair<std::string, std::string>> batch;
-  for (size_t i = 0; i < BATCH_SIZE; ++i) {
-    auto message = dequeue_message(redis_ctx);
-    if (!message.first.empty()) {
-      batch.push_back(message);
-    } else {
-      break;
+    if (!reply || reply->type != REDIS_REPLY_ARRAY) {
+      if (reply)
+        freeReplyObject(reply);
+      continue;
     }
+
+    for (size_t i = 0; i < reply->elements; ++i) {
+      redisReply *message = reply->element[i];
+      if (message && message->type == REDIS_REPLY_ARRAY &&
+          message->elements >= 2) {
+        std::string message_id = message->element[0]->str;
+        std::string message_body = message->element[1]->str;
+
+        std::string enqueue_command =
+            "LPUSH messages_queue " + message_body + " " + consumer + "\r\n";
+        redisReply *enqueue_reply = static_cast<redisReply *>(
+            redisCommand(redis_ctx, enqueue_command.c_str()));
+        if (enqueue_reply)
+          freeReplyObject(enqueue_reply);
+
+        // Acknowledge the message
+        std::string ack_command =
+            "XACK messages:published " + group + " " + message_id + "\r\n";
+        redisReply *ack_reply = static_cast<redisReply *>(
+            redisCommand(redis_ctx, ack_command.c_str()));
+        if (ack_reply)
+          freeReplyObject(ack_reply);
+      }
+    }
+    freeReplyObject(reply);
   }
-  return batch;
 }
 
+// Process a batch of messages
 void process_batch(
     redisContext *redis_ctx,
     const std::vector<std::pair<std::string, std::string>> &batch) {
@@ -127,14 +109,6 @@ void process_batch(
     try {
       json msg_json = json::parse(message);
       std::string message_id = msg_json["message_id"].get<std::string>();
-
-      if (is_message_processed(redis_ctx, message_id)) {
-        continue;
-      }
-      mark_message_as_processed(redis_ctx, message_id);
-
-      msg_json["processed_by"] = consumer_id;
-      std::cout << "Processed message: " << msg_json.dump() << std::endl;
 
       std::string command = "XADD messages:processed * message_id " +
                             message_id + " processed_by " + consumer_id +
@@ -154,101 +128,69 @@ void process_batch(
 
 void process_message_batch(redisContext *redis_ctx) {
   while (keep_running) {
-    auto batch = fetch_message_batch(redis_ctx);
-    process_batch(redis_ctx, batch);
-  }
-}
-
-void consume_messages(redisContext *redis_ctx, const std::string &consumer_id) {
-  if (!redis_ctx) {
-    std::cerr << "Error: Redis connection is null for SUBSCRIBE." << std::endl;
-    return;
-  }
-
-  redisReader *reader = redisReaderCreate();
-  if (!reader) {
-    std::cerr << "Error: Failed to create Redis reader." << std::endl;
-    return;
-  }
-
-  char buffer[BUFFER_SIZE];
-  while (keep_running) {
-    ssize_t bytes_read = read(redis_ctx->fd, buffer, sizeof(buffer));
-    if (bytes_read <= 0) {
-      std::cerr << "Error: Failed to read from socket." << std::endl;
-      break;
-    }
-
-    redisReaderFeed(reader, buffer, bytes_read);
-
-    void *reply = nullptr;
-    while (redisReaderGetReply(reader, &reply) == REDIS_OK &&
-           reply != nullptr) {
-      redisReply *redis_reply = static_cast<redisReply *>(reply);
-      if (!redis_reply || redis_reply->type != REDIS_REPLY_ARRAY ||
-          redis_reply->elements < 3) {
-        std::cerr << "Error: Invalid Redis reply structure." << std::endl;
-        if (reply)
-          freeReplyObject(reply);
-        continue;
-      }
-
-      redisReply *message_element = redis_reply->element[2];
-      if (!message_element || message_element->type != REDIS_REPLY_STRING) {
-        std::cerr << "Error: Redis reply element[2] is null or not a string."
-                  << std::endl;
+    std::string dequeue_command =
+        "LRANGE messages_queue 0 " + std::to_string(BATCH_SIZE - 1) + "\r\n";
+    redisReply *reply = static_cast<redisReply *>(
+        redisCommand(redis_ctx, dequeue_command.c_str()));
+    if (!reply || reply->type != REDIS_REPLY_ARRAY) {
+      if (reply)
         freeReplyObject(reply);
-        continue;
-      }
-
-      std::string message(message_element->str, message_element->len);
-      enqueue_message(redis_ctx, message, consumer_id);
-      freeReplyObject(reply);
+      continue;
     }
+
+    std::vector<std::pair<std::string, std::string>> batch;
+    for (size_t i = 0; i < reply->elements; ++i) {
+      std::string message(reply->element[i]->str, reply->element[i]->len);
+      batch.emplace_back(message, "worker");
+    }
+
+    process_batch(redis_ctx, batch);
+
+    std::string trim_command =
+        "LTRIM messages_queue " + std::to_string(BATCH_SIZE) + " -1\r\n";
+    redisReply *trim_reply = static_cast<redisReply *>(
+        redisCommand(redis_ctx, trim_command.c_str()));
+    if (trim_reply)
+      freeReplyObject(trim_reply);
+
+    freeReplyObject(reply);
   }
-
-  redisReaderFree(reader);
-}
-
-void consumer_thread(const std::string &consumer_id, const std::string &channel,
-                     const std::string &redis_host, int redis_port) {
-  redisContext *redis_ctx = create_redis_connection(redis_host, redis_port);
-  if (!redis_ctx)
-    return;
-
-  int socket_fd = redis_ctx->fd;
-  std::string subscribe_command = "SUBSCRIBE " + channel + "\r\n";
-  if (write(socket_fd, subscribe_command.c_str(), subscribe_command.size()) <
-      0) {
-    std::cerr << "Error: Failed to send SUBSCRIBE command." << std::endl;
-    redisFree(redis_ctx);
-    return;
-  }
-
-  consume_messages(redis_ctx, consumer_id);
-  redisFree(redis_ctx);
 }
 
 int main(int argc, char *argv[]) {
-  if (argc < 4) {
+  if (argc < 5) {
     std::cerr << "Usage: " << argv[0]
-              << " <consumer_count> <redis_host> <redis_port>" << std::endl;
+              << " <consumer_count> <redis_host> <redis_port> <group_name>"
+              << std::endl;
     return 1;
   }
 
   int consumer_count = std::stoi(argv[1]);
   std::string redis_host = argv[2];
   int redis_port = std::stoi(argv[3]);
-  std::string channel = "messages:published";
+  std::string group_name = argv[4];
 
   signal(SIGINT, signal_handler);
+
+  redisContext *setup_ctx = create_redis_connection(redis_host, redis_port);
+  if (!setup_ctx)
+    return 1;
+
+  std::string group_command =
+      "XGROUP CREATE messages:published " + group_name + " $ MKSTREAM\r\n";
+  redisReply *group_reply =
+      static_cast<redisReply *>(redisCommand(setup_ctx, group_command.c_str()));
+  if (group_reply)
+    freeReplyObject(group_reply);
+  redisFree(setup_ctx);
 
   std::thread monitor_thread(monitor_throughput);
 
   std::vector<std::thread> consumers;
   for (int i = 0; i < consumer_count; ++i) {
-    consumers.emplace_back(consumer_thread, "consumer_" + std::to_string(i + 1),
-                           channel, redis_host, redis_port);
+    consumers.emplace_back(consume_stream_messages,
+                           create_redis_connection(redis_host, redis_port),
+                           group_name, "consumer_" + std::to_string(i + 1));
   }
 
   redisContext *xadd_redis_ctx =
