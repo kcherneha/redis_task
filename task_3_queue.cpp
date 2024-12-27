@@ -21,6 +21,7 @@ using json = nlohmann::json;
 constexpr size_t BUFFER_SIZE = 4096;
 constexpr size_t BATCH_SIZE = 100;
 
+// Global state and synchronization primitives
 std::atomic<bool> keep_running(true);
 std::atomic<int> messages_processed(0);
 std::unordered_set<std::string> processed_messages;
@@ -29,11 +30,13 @@ std::queue<std::pair<std::string, std::string>> message_queue;
 std::mutex queue_mutex;
 std::condition_variable queue_condition;
 
+// Signal handler
 void signal_handler(int signum) {
   keep_running = false;
   queue_condition.notify_all();
 }
 
+// Monitor throughput of processed messages
 void monitor_throughput() {
   while (keep_running) {
     std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -45,6 +48,7 @@ void monitor_throughput() {
   }
 }
 
+// Create Redis connection
 redisContext *create_redis_connection(const std::string &redis_host,
                                       int redis_port) {
   redisContext *redis_ctx = redisConnect(redis_host.c_str(), redis_port);
@@ -59,16 +63,9 @@ redisContext *create_redis_connection(const std::string &redis_host,
   return redis_ctx;
 }
 
-void send_xadd(redisContext *redis_ctx, const std::string &stream,
-               const std::string &message_id, const std::string &processed_by) {
-  if (!redis_ctx) {
-    std::cerr << "Error: Redis connection is null for XADD." << std::endl;
-    return;
-  }
-
-  std::string xadd_command = "XADD " + stream + " * message_id " + message_id +
-                             " processed_by " + processed_by + "\r\n";
-  if (write(redis_ctx->fd, xadd_command.c_str(), xadd_command.size()) < 0) {
+// Send an XADD command to Redis
+void send_xadd_impl(redisContext *redis_ctx, const std::string &command) {
+  if (write(redis_ctx->fd, command.c_str(), command.size()) < 0) {
     std::cerr << "Error: Failed to send XADD command." << std::endl;
     return;
   }
@@ -76,8 +73,8 @@ void send_xadd(redisContext *redis_ctx, const std::string &stream,
   char buffer[BUFFER_SIZE];
   ssize_t bytes_read = read(redis_ctx->fd, buffer, sizeof(buffer));
   if (bytes_read > 0) {
-    redisReply *reply = static_cast<redisReply *>(
-        redisCommand(redis_ctx, xadd_command.c_str()));
+    redisReply *reply =
+        static_cast<redisReply *>(redisCommand(redis_ctx, command.c_str()));
     if (reply) {
       if (reply->type == REDIS_REPLY_ERROR) {
         std::cerr << "Error: XADD command failed: " << reply->str << std::endl;
@@ -87,55 +84,95 @@ void send_xadd(redisContext *redis_ctx, const std::string &stream,
   } else {
     std::cerr << "Error: Failed to read response for XADD." << std::endl;
   }
-
-  // std::cout << "XADD succeeded " << std::endl;
 }
 
-void process_message_batch(redisContext *redis_ctx) {
-  while (keep_running) {
-    std::vector<std::pair<std::string, std::string>> batch;
-    {
-      std::unique_lock<std::mutex> lock(queue_mutex);
-      queue_condition.wait(
-          lock, [] { return !message_queue.empty() || !keep_running; });
-      while (!message_queue.empty() && batch.size() < BATCH_SIZE) {
-        batch.push_back(message_queue.front());
-        message_queue.pop();
-      }
-    }
+void send_xadd(redisContext *redis_ctx, const std::string &stream,
+               const std::string &message_id, const std::string &processed_by) {
+  if (!redis_ctx) {
+    std::cerr << "Error: Redis connection is null for XADD." << std::endl;
+    return;
+  }
 
-    for (const auto &[message, consumer_id] : batch) {
-      try {
-        json msg_json = json::parse(message);
-        std::string message_id = msg_json["message_id"].get<std::string>();
+  std::string command = "XADD " + stream + " * message_id " + message_id +
+                        " processed_by " + processed_by + "\r\n";
+  send_xadd_impl(redis_ctx, command);
+}
 
-        // Check if the message has already been processed
-        {
-          std::lock_guard<std::mutex> lock(processed_messages_mutex);
-          if (processed_messages.find(message_id) != processed_messages.end()) {
-            // std::cerr << "Message " << message_id << " already processed.
-            // Skipping." << std::endl;
-            continue;
-          }
-          processed_messages.insert(message_id);
+std::vector<std::pair<std::string, std::string>> fetch_message_batch() {
+  std::vector<std::pair<std::string, std::string>> batch;
+  std::unique_lock<std::mutex> lock(queue_mutex);
+  queue_condition.wait(lock,
+                       [] { return !message_queue.empty() || !keep_running; });
+  while (!message_queue.empty() && batch.size() < BATCH_SIZE) {
+    batch.push_back(message_queue.front());
+    message_queue.pop();
+  }
+  return batch;
+}
+
+void process_batch(
+    redisContext *redis_ctx,
+    const std::vector<std::pair<std::string, std::string>> &batch) {
+  for (const auto &[message, consumer_id] : batch) {
+    try {
+      json msg_json = json::parse(message);
+      std::string message_id = msg_json["message_id"].get<std::string>();
+
+      {
+        std::lock_guard<std::mutex> lock(processed_messages_mutex);
+        if (processed_messages.find(message_id) != processed_messages.end()) {
+          continue;
         }
-
-        msg_json["processed_by"] = consumer_id;
-        std::cout << "Processed message: " << msg_json.dump() << std::endl;
-
-        // Use XADD to append to the Redis stream
-        send_xadd(redis_ctx, "messages:processed", message_id, consumer_id);
-
-        // Increment the processed messages count
-        messages_processed.fetch_add(1, std::memory_order_relaxed);
-
-      } catch (const std::exception &e) {
-        std::cerr << "Error processing message: " << e.what() << std::endl;
+        processed_messages.insert(message_id);
       }
+
+      msg_json["processed_by"] = consumer_id;
+      std::cout << "Processed message: " << msg_json.dump() << std::endl;
+
+      send_xadd(redis_ctx, "messages:processed", message_id, consumer_id);
+      messages_processed.fetch_add(1, std::memory_order_relaxed);
+
+    } catch (const std::exception &e) {
+      std::cerr << "Error processing message: " << e.what() << std::endl;
     }
   }
 }
 
+// Process a batch of messages
+void process_message_batch(redisContext *redis_ctx) {
+  while (keep_running) {
+    auto batch = fetch_message_batch();
+    process_batch(redis_ctx, batch);
+  }
+}
+
+void parse_redis_reply(redisReply *reply, const std::string &consumer_id) {
+  if (!reply || reply->type != REDIS_REPLY_ARRAY || reply->elements < 3) {
+    std::cerr << "Error: Invalid Redis reply structure." << std::endl;
+    return;
+  }
+
+  redisReply *message_element = reply->element[2];
+  if (!message_element || message_element->type != REDIS_REPLY_STRING) {
+    std::cerr << "Error: Redis reply element[2] is null or not a string."
+              << std::endl;
+    return;
+  }
+
+  std::string message(message_element->str, message_element->len);
+  if (message.empty()) {
+    std::cerr << "Error: Empty message received." << std::endl;
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    message_queue.emplace(message, consumer_id);
+  }
+  queue_condition.notify_one();
+}
+
+// Consume messages from Redis Pub/Sub
 void consume_messages(redisContext *redis_ctx, const std::string &consumer_id) {
   if (!redis_ctx) {
     std::cerr << "Error: Redis connection is null for SUBSCRIBE." << std::endl;
@@ -161,36 +198,7 @@ void consume_messages(redisContext *redis_ctx, const std::string &consumer_id) {
     void *reply = nullptr;
     while (redisReaderGetReply(reader, &reply) == REDIS_OK &&
            reply != nullptr) {
-      redisReply *redis_reply = static_cast<redisReply *>(reply);
-      if (!redis_reply || redis_reply->type != REDIS_REPLY_ARRAY ||
-          redis_reply->elements < 3) {
-        std::cerr << "Error: Invalid Redis reply structure." << std::endl;
-        if (reply)
-          freeReplyObject(reply);
-        continue;
-      }
-
-      redisReply *message_element = redis_reply->element[2];
-      if (!message_element || message_element->type != REDIS_REPLY_STRING) {
-        std::cerr << "Error: Redis reply element[2] is null or not a string."
-                  << std::endl;
-        freeReplyObject(reply);
-        continue;
-      }
-
-      std::string message(message_element->str, message_element->len);
-
-      if (message.empty()) {
-        std::cerr << "Error: Empty message received." << std::endl;
-        freeReplyObject(reply);
-        continue;
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        message_queue.emplace(message, consumer_id);
-      }
-      queue_condition.notify_one();
+      parse_redis_reply(static_cast<redisReply *>(reply), consumer_id);
       freeReplyObject(reply);
     }
   }
@@ -198,6 +206,7 @@ void consume_messages(redisContext *redis_ctx, const std::string &consumer_id) {
   redisReaderFree(reader);
 }
 
+// Thread for consuming messages
 void consumer_thread(const std::string &consumer_id, const std::string &channel,
                      const std::string &redis_host, int redis_port) {
   redisContext *redis_ctx = create_redis_connection(redis_host, redis_port);
@@ -215,7 +224,6 @@ void consumer_thread(const std::string &consumer_id, const std::string &channel,
   }
 
   consume_messages(redis_ctx, consumer_id);
-
   redisFree(redis_ctx);
 }
 
@@ -228,7 +236,6 @@ int main(int argc, char *argv[]) {
 
   int consumer_count = std::stoi(argv[1]);
   std::string redis_host = argv[2];
-  std::cout << redis_host << std::endl;
   int redis_port = std::stoi(argv[3]);
   std::string channel = "messages:published";
 
@@ -272,8 +279,6 @@ int main(int argc, char *argv[]) {
   }
 
   redisFree(xadd_redis_ctx);
-
-  // Stop monitoring thread
   keep_running = false;
   monitor_thread.join();
 
