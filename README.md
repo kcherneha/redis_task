@@ -89,7 +89,7 @@ To build and run the GoogleTest-based test suite:
 ## Possible improvements
 
 XREADGROUP usage and some advanced stream processing (need to read more documentation and examples), async operations without redundant connections creation and overall non-blocking event driven approach. 
-I guess monitoring can be achieved by redis functionality, as well as message queue processing, but I need to investigate this.
+I guess monitoring can be achieved by redis functionality, as well as message queue processing, but I need to investigate this. Also, deduplication process can be changed on redis SET, probably, to keep only unique values.
 
 ## License
 
