@@ -78,8 +78,10 @@ void consume_stream_messages(redisContext *redis_ctx, const std::string &group,
       redisReply *message = reply->element[i];
       if (message && message->type == REDIS_REPLY_ARRAY &&
           message->elements >= 2) {
-        std::string message_id = message->element[0]->str;
-        std::string message_body = message->element[1]->str;
+        std::string message_id(message->element[0]->str,
+                               message->element[0]->len);
+        std::string message_body(message->element[1]->str,
+                                 message->element[1]->len);
 
         std::string enqueue_command =
             "LPUSH messages_queue " + message_body + " " + consumer + "\r\n";
@@ -140,8 +142,10 @@ void process_message_batch(redisContext *redis_ctx) {
 
     std::vector<std::pair<std::string, std::string>> batch;
     for (size_t i = 0; i < reply->elements; ++i) {
-      std::string message(reply->element[i]->str, reply->element[i]->len);
-      batch.emplace_back(message, "worker");
+      if (reply->element[i]->type == REDIS_REPLY_STRING) {
+        std::string message(reply->element[i]->str, reply->element[i]->len);
+        batch.emplace_back(message, "worker");
+      }
     }
 
     process_batch(redis_ctx, batch);
