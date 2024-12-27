@@ -73,16 +73,6 @@ TEST_F(BatchProcessingRAIITest, HandleDuplicateMessages) {
   // Ensure duplicates are not processed twice by checking `processed_messages`.
 }
 
-class SignalHandlingTest : public ::testing::Test {
-protected:
-  void SetUp() override { keep_running = true; }
-};
-
-TEST_F(SignalHandlingTest, HandleSIGINT) {
-  signal_handler(SIGINT);
-  EXPECT_FALSE(keep_running.load());
-}
-
 class ThroughputMonitoringTest : public ::testing::Test {
 protected:
   std::atomic<int> messages_processed;

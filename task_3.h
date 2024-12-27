@@ -49,8 +49,6 @@ private:
   redisContext *redis_ctx_;
 };
 
-void signal_handler(int signum);
-
 void monitor_throughput();
 
 // Redis message sending

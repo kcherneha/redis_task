@@ -24,11 +24,6 @@ std::atomic<bool> keep_running(true);
 std::atomic<int> messages_processed(0);
 moodycamel::ConcurrentQueue<std::pair<std::string, std::string>> message_queue;
 
-void signal_handler(int signum) {
-  keep_running = false;
-  std::cerr << "Signal handler triggered. Shutting down..." << std::endl;
-}
-
 void monitor_throughput() {
   while (keep_running) {
     std::this_thread::sleep_for(std::chrono::seconds(2));
