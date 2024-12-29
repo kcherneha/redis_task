@@ -5,7 +5,12 @@ This code is hosted on GitHub:
 
 ## Requirements
 
-### Prerequisites
+### Run via Docker
+- docker build -t my_cpp_app .
+- docker run -d --name my_cpp_app_container -p 8080:8080 my_cpp_app
+- check consumer_queue.log file after running
+
+### Manual installation: prerequisites
 
 - **Redis**: Ensure Redis is installed and running: for that task you need to run redis-server and provided Python script for publisher.
 - **C++ Compiler**: A modern C++ compiler with C++17 support (e.g., GCC 7+, Clang 6+, or MSVC 2017+).
