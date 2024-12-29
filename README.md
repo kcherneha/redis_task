@@ -10,6 +10,9 @@ This code is hosted on GitHub:
 - docker run -d --name my_cpp_app_container -p 8080:8080 my_cpp_app
 - check consumer_queue.log file after running
 
+![Description of the image](./image.png)
+
+
 ### Manual installation: prerequisites
 
 - **Redis**: Ensure Redis is installed and running: for that task you need to run redis-server and provided Python script for publisher.
