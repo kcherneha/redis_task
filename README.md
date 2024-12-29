@@ -20,7 +20,11 @@ brew install hiredis
 header-only lib, already included in this repo
 
 - [nlohmann/json](https://github.com/nlohmann/json): For JSON handling.
+macos:
 brew install nlohmann-json
+
+linux:
+https://github.com/nlohmann/json/issues/1703
 
 ## Build Instructions
 
